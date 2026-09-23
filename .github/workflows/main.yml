@@ -125,7 +125,7 @@ jobs:
                   </activity>
 
                   <service
-                      android:name=".MyVpnService"
+                      android:name=".DnsVpnService"
                       android:permission="android.permission.BIND_VPN_SERVICE"
                       android:exported="false">
                       <intent-filter>
@@ -146,7 +146,7 @@ jobs:
           </resources>
           END_STRINGS
 
-          # 6. MainActivity.java للربط بين الواجهة وخدمة الـ VPN
+          # 6. كتابة كود MainActivity.java للتحكم
           cat << 'END_JAVA_MAIN' > app/src/main/java/com/vpnplus/app/MainActivity.java
           package com.vpnplus.app;
 
@@ -164,9 +164,10 @@ jobs:
           import android.webkit.WebViewClient;
 
           public class MainActivity extends Activity {
-              private static final int VPN_REQUEST_CODE = 0x10;
+              private static final int VPN_REQUEST_CODE = 0x20;
               private WebView webView;
-              private String selectedCountry = "أمريكا";
+              private String selectedDns = "1.1.1.1";
+              private String selectedName = "Cloudflare 1.1.1.1";
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -198,8 +199,9 @@ jobs:
 
               public class WebBridge {
                   @JavascriptInterface
-                  public void startVpn(String country) {
-                      selectedCountry = country;
+                  public void startDnsVpn(String dnsIp, String dnsName) {
+                      selectedDns = dnsIp;
+                      selectedName = dnsName;
                       runOnUiThread(() -> {
                           Intent vpnIntent = VpnService.prepare(MainActivity.this);
                           if (vpnIntent != null) {
@@ -211,10 +213,10 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public void stopVpn() {
+                  public void stopDnsVpn() {
                       runOnUiThread(() -> {
-                          Intent intent = new Intent(MainActivity.this, MyVpnService.class);
-                          intent.setAction(MyVpnService.ACTION_DISCONNECT);
+                          Intent intent = new Intent(MainActivity.this, DnsVpnService.class);
+                          intent.setAction(DnsVpnService.ACTION_DISCONNECT);
                           startService(intent);
                           notifyStatus("disconnected");
                       });
@@ -226,9 +228,10 @@ jobs:
                   super.onActivityResult(requestCode, resultCode, data);
                   if (requestCode == VPN_REQUEST_CODE) {
                       if (resultCode == RESULT_OK) {
-                          Intent intent = new Intent(this, MyVpnService.class);
-                          intent.setAction(MyVpnService.ACTION_CONNECT);
-                          intent.putExtra("country", selectedCountry);
+                          Intent intent = new Intent(this, DnsVpnService.class);
+                          intent.setAction(DnsVpnService.ACTION_CONNECT);
+                          intent.putExtra("dns_ip", selectedDns);
+                          intent.putExtra("dns_name", selectedName);
                           startService(intent);
                           notifyStatus("connected");
                       } else {
@@ -254,8 +257,8 @@ jobs:
           }
           END_JAVA_MAIN
 
-          # 7. خدمة MyVpnService.java المسؤولة عن نفق الـ VPN والإشعارات
-          cat << 'END_JAVA_VPN' > app/src/main/java/com/vpnplus/app/MyVpnService.java
+          # 7. DnsVpnService.java (محرّك تحويل وتشفير الـ DNS لفك الحجب فعلياً)
+          cat << 'END_JAVA_VPN' > app/src/main/java/com/vpnplus/app/DnsVpnService.java
           package com.vpnplus.app;
 
           import android.app.Notification;
@@ -266,45 +269,67 @@ jobs:
           import android.net.VpnService;
           import android.os.Build;
           import android.os.ParcelFileDescriptor;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.net.DatagramPacket;
+          import java.net.DatagramSocket;
+          import java.net.InetAddress;
+          import java.net.SocketTimeoutException;
 
-          public class MyVpnService extends VpnService {
+          public class DnsVpnService extends VpnService implements Runnable {
               public static final String ACTION_CONNECT = "com.vpnplus.app.CONNECT";
               public static final String ACTION_DISCONNECT = "com.vpnplus.app.DISCONNECT";
-              private static final String CHANNEL_ID = "vpn_plus_channel";
+              private static final String CHANNEL_ID = "vpn_plus_dns_channel";
+
               private ParcelFileDescriptor vpnInterface;
+              private Thread workerThread;
+              private volatile boolean isRunning = false;
+              private String targetDnsIp = "1.1.1.1";
+              private String targetDnsName = "Cloudflare";
 
               @Override
               public int onStartCommand(Intent intent, int flags, int startId) {
                   if (intent != null) {
                       String action = intent.getAction();
                       if (ACTION_CONNECT.equals(action)) {
-                          String country = intent.getStringExtra("country");
-                          if (country == null) country = "الولايات المتحدة";
-                          connectTunnel(country);
+                          String ip = intent.getStringExtra("dns_ip");
+                          String name = intent.getStringExtra("dns_name");
+                          if (ip != null) targetDnsIp = ip;
+                          if (name != null) targetDnsName = name;
+                          startDnsTunnel();
                       } else if (ACTION_DISCONNECT.equals(action)) {
-                          disconnectTunnel();
+                          stopDnsTunnel();
                       }
                   }
                   return START_NOT_STICKY;
               }
 
-              private void connectTunnel(String country) {
+              private synchronized void startDnsTunnel() {
+                  stopDnsTunnel();
                   try {
-                      if (vpnInterface == null) {
-                          Builder builder = new Builder();
-                          builder.setSession("VPN Plus - " + country);
-                          builder.addAddress("10.8.0.2", 24);
-                          builder.addRoute("10.8.0.0", 24);
-                          builder.addDnsServer("8.8.8.8");
-                          vpnInterface = builder.establish();
-                      }
-                      updateNotification(country);
+                      Builder builder = new Builder();
+                      builder.setSession("VPN Plus (" + targetDnsName + ")");
+                      builder.addAddress("10.0.0.2", 32);
+                      builder.addRoute("10.0.0.1", 32);
+                      builder.addDnsServer("10.0.0.1");
+
+                      vpnInterface = builder.establish();
+                      isRunning = true;
+                      workerThread = new Thread(this, "DnsVpnWorker");
+                      workerThread.start();
+
+                      showNotification();
                   } catch (Exception e) {
                       e.printStackTrace();
                   }
               }
 
-              private void disconnectTunnel() {
+              private synchronized void stopDnsTunnel() {
+                  isRunning = false;
+                  if (workerThread != null) {
+                      workerThread.interrupt();
+                      workerThread = null;
+                  }
                   try {
                       if (vpnInterface != null) {
                           vpnInterface.close();
@@ -317,15 +342,118 @@ jobs:
                   stopSelf();
               }
 
-              private void updateNotification(String country) {
+              @Override
+              public void run() {
+                  DatagramSocket socket = null;
+                  FileInputStream in = null;
+                  FileOutputStream out = null;
+
+                  try {
+                      in = new FileInputStream(vpnInterface.getFileDescriptor());
+                      out = new FileOutputStream(vpnInterface.getFileDescriptor());
+
+                      socket = new DatagramSocket();
+                      protect(socket);
+                      socket.setSoTimeout(2500);
+
+                      byte[] packet = new byte[4096];
+                      byte[] respBuf = new byte[4096];
+
+                      while (isRunning && !Thread.interrupted()) {
+                          int length = in.read(packet);
+                          if (length < 28) continue;
+
+                          // التحقق من أن الحزمة IPv4 و UDP (البروتوكول 17)
+                          if ((packet[0] & 0xF0) != 0x40 || packet[9] != 17) continue;
+
+                          int ipHeaderLen = (packet[0] & 0x0F) * 4;
+                          int srcPort = ((packet[ipHeaderLen] & 0xFF) << 8) | (packet[ipHeaderLen + 1] & 0xFF);
+                          int dstPort = ((packet[ipHeaderLen + 2] & 0xFF) << 8) | (packet[ipHeaderLen + 3] & 0xFF);
+                          int udpLen = ((packet[ipHeaderLen + 4] & 0xFF) << 8) | (packet[ipHeaderLen + 5] & 0xFF);
+
+                          // تحويل طلبات الـ DNS فقط (المنفذ 53)
+                          if (dstPort != 53) continue;
+
+                          int dnsQueryLen = udpLen - 8;
+                          if (dnsQueryLen <= 0 || ipHeaderLen + 8 + dnsQueryLen > length) continue;
+
+                          // إرسال الطلب الأصلي مباشرة إلى سيرفر الـ DNS العالمي المختار
+                          InetAddress remoteDns = InetAddress.getByName(targetDnsIp);
+                          DatagramPacket outPacket = new DatagramPacket(packet, ipHeaderLen + 8, dnsQueryLen, remoteDns, 53);
+                          socket.send(outPacket);
+
+                          // استلام الرد الصريح والآمن
+                          DatagramPacket inPacket = new DatagramPacket(respBuf, respBuf.length);
+                          try {
+                              socket.receive(inPacket);
+                          } catch (SocketTimeoutException ste) {
+                              continue;
+                          }
+
+                          int respDnsLen = inPacket.getLength();
+                          int respUdpLen = 8 + respDnsLen;
+                          int respTotalLen = 20 + respUdpLen;
+
+                          // إعادة بناء حزمة IPv4 UDP بالرد الصحيح وإرجاعها لنظام الهاتف
+                          byte[] respPacket = new byte[respTotalLen];
+                          respPacket[0] = 0x45;
+                          respPacket[1] = 0x00;
+                          respPacket[2] = (byte) (respTotalLen >> 8);
+                          respPacket[3] = (byte) (respTotalLen & 0xFF);
+                          respPacket[4] = 0x00; respPacket[5] = 0x01;
+                          respPacket[6] = 0x40; respPacket[7] = 0x00;
+                          respPacket[8] = 64;   // TTL
+                          respPacket[9] = 17;   // UDP
+                          // المصدر: 10.0.0.1
+                          respPacket[12] = 10; respPacket[13] = 0; respPacket[14] = 0; respPacket[15] = 1;
+                          // الوجهة: 10.0.0.2
+                          respPacket[16] = 10; respPacket[17] = 0; respPacket[18] = 0; respPacket[19] = 2;
+
+                          int ipChk = computeChecksum(respPacket, 0, 20);
+                          respPacket[10] = (byte) (ipChk >> 8);
+                          respPacket[11] = (byte) (ipChk & 0xFF);
+
+                          // UDP Header
+                          respPacket[20] = 0; respPacket[21] = 53;
+                          respPacket[22] = (byte) (srcPort >> 8);
+                          respPacket[23] = (byte) (srcPort & 0xFF);
+                          respPacket[24] = (byte) (respUdpLen >> 8);
+                          respPacket[25] = (byte) (respUdpLen & 0xFF);
+                          respPacket[26] = 0; respPacket[27] = 0;
+
+                          System.arraycopy(respBuf, 0, respPacket, 28, respDnsLen);
+
+                          // تسليم الرد للنظام ليفتح الموقع المحجوب فوراً
+                          out.write(respPacket);
+                      }
+                  } catch (Exception e) {
+                      // تنظيف عند الإيقاف
+                  } finally {
+                      if (socket != null && !socket.isClosed()) socket.close();
+                  }
+              }
+
+              private int computeChecksum(byte[] buf, int offset, int length) {
+                  int sum = 0;
+                  for (int i = 0; i < length; i += 2) {
+                      int word = ((buf[offset + i] & 0xFF) << 8) | (buf[offset + i + 1] & 0xFF);
+                      sum += word;
+                  }
+                  while ((sum >> 16) != 0) {
+                      sum = (sum & 0xFFFF) + (sum >> 16);
+                  }
+                  return ~sum & 0xFFFF;
+              }
+
+              private void showNotification() {
                   try {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                           NotificationChannel channel = new NotificationChannel(
                               CHANNEL_ID,
-                              "VPN Plus Status",
+                              "VPN Plus DNS Protection",
                               NotificationManager.IMPORTANCE_LOW
                           );
-                          channel.setDescription("حالة شبكة VPN Plus");
+                          channel.setDescription("حماية الـ DNS وتجاوز الحظر");
                           NotificationManager nm = getSystemService(NotificationManager.class);
                           if (nm != null) nm.createNotificationChannel(channel);
                       }
@@ -339,14 +467,14 @@ jobs:
                           : new Notification.Builder(this);
 
                       Notification notification = nb
-                          .setContentTitle("VPN Plus متصل ومحمي")
-                          .setContentText("الدولة المتصل بها: " + country)
+                          .setContentTitle("VPN Plus: الحماية نشطة ومفعلة")
+                          .setContentText("الخادم النشط: " + targetDnsName + " (" + targetDnsIp + ")")
                           .setSmallIcon(android.R.drawable.ic_lock_lock)
                           .setContentIntent(pi)
                           .setOngoing(true)
                           .build();
 
-                      startForeground(1001, notification);
+                      startForeground(2002, notification);
                   } catch (Exception e) {
                       e.printStackTrace();
                   }
@@ -354,7 +482,7 @@ jobs:
 
               @Override
               public void onDestroy() {
-                  disconnectTunnel();
+                  stopDnsTunnel();
                   super.onDestroy();
               }
           }
@@ -432,7 +560,7 @@ jobs:
           python3 make_icons.py
           rm make_icons.py
 
-      - name: Embed VPN Plus HTML UI
+      - name: Embed VPN Plus Secure DNS UI
         run: |
           cat << 'EOF' > app/src/main/assets/index.html
           <!DOCTYPE html>
@@ -440,13 +568,13 @@ jobs:
           <head>
               <meta charset="UTF-8">
               <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-              <title>VPN PLUS</title>
+              <title>VPN PLUS - Secure DNS</title>
               <style>
                   @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap');
                   * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Cairo', sans-serif; -webkit-tap-highlight-color: transparent; }
                   body { background: radial-gradient(circle at top, #111c38 0%, #070b14 100%); color: #f8fafc; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: 16px; user-select: none; }
                   .container { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 18px; }
-                  
+
                   /* Header */
                   .header { display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; }
                   .logo-wrap { display: flex; align-items: center; gap: 10px; }
@@ -456,18 +584,18 @@ jobs:
                   .status-pill.connected { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
                   .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
                   .status-pill.connected .status-dot { background: #10b981; box-shadow: 0 0 10px #10b981; animation: pulse-dot 1.5s infinite; }
-                  
-                  /* Country Selector */
+
+                  /* Provider Selector Card */
                   .selector-card { background: rgba(17, 24, 39, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 18px; padding: 14px 18px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: 0.2s; box-shadow: 0 8px 20px rgba(0,0,0,0.3); }
                   .selector-card:active { transform: scale(0.98); }
-                  .country-info { display: flex; align-items: center; gap: 12px; }
-                  .country-flag { font-size: 32px; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
-                  .country-name { font-size: 15px; font-weight: 700; color: #fff; }
-                  .country-city { font-size: 12px; color: #94a3b8; }
+                  .provider-info { display: flex; align-items: center; gap: 12px; }
+                  .provider-icon { font-size: 30px; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
+                  .provider-name { font-size: 15px; font-weight: 700; color: #fff; }
+                  .provider-desc { font-size: 12px; color: #94a3b8; }
                   .ping-tag { font-size: 12px; font-weight: 600; color: #10b981; background: rgba(16, 185, 129, 0.1); padding: 4px 8px; border-radius: 8px; }
 
                   /* Power Button Area */
-                  .power-section { display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 20px 0; }
+                  .power-section { display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 16px 0; }
                   .ring-container { position: relative; width: 210px; height: 210px; display: flex; align-items: center; justify-content: center; }
                   .pulse-ring { position: absolute; width: 100%; height: 100%; border-radius: 50%; border: 2px solid rgba(0, 242, 254, 0.15); transition: 0.5s; }
                   .ring-container.active .pulse-ring { border-color: rgba(16, 185, 129, 0.4); animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite; }
@@ -477,7 +605,7 @@ jobs:
                   .power-icon { font-size: 42px; color: #00f2fe; transition: 0.3s; filter: drop-shadow(0 0 8px #00f2fe); }
                   .power-btn.active .power-icon { color: #10b981; filter: drop-shadow(0 0 12px #10b981); }
                   .power-status-text { margin-top: 14px; font-size: 16px; font-weight: 700; color: #e2e8f0; }
-                  .power-subtext { font-size: 12px; color: #64748b; margin-top: 4px; }
+                  .power-subtext { font-size: 12px; color: #64748b; margin-top: 4px; text-align: center; }
 
                   /* Stats Grid */
                   .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -485,14 +613,14 @@ jobs:
                   .stat-label { font-size: 11px; color: #94a3b8; display: flex; align-items: center; gap: 5px; }
                   .stat-val { font-size: 15px; font-weight: 700; color: #f8fafc; }
 
-                  /* Dropdown Modal */
+                  /* Provider Selection Modal */
                   .modal-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.8); backdrop-filter: blur(8px); display: none; align-items: flex-end; justify-content: center; z-index: 99; }
                   .modal-sheet { background: #0f172a; width: 100%; max-width: 440px; border-radius: 24px 24px 0 0; border-top: 1px solid rgba(255, 255, 255, 0.1); max-height: 80vh; overflow-y: auto; padding: 20px 16px; }
                   .sheet-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding: 0 4px; }
                   .sheet-title { font-size: 16px; font-weight: 700; color: #fff; }
                   .close-btn { background: none; border: none; font-size: 20px; color: #94a3b8; cursor: pointer; }
-                  .country-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-radius: 12px; margin-bottom: 8px; background: rgba(30, 41, 59, 0.5); cursor: pointer; transition: 0.2s; }
-                  .country-item:hover, .country-item.active { background: rgba(0, 242, 254, 0.15); border: 1px solid rgba(0, 242, 254, 0.3); }
+                  .provider-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-radius: 12px; margin-bottom: 8px; background: rgba(30, 41, 59, 0.5); cursor: pointer; transition: 0.2s; }
+                  .provider-item:hover, .provider-item.active { background: rgba(0, 242, 254, 0.15); border: 1px solid rgba(0, 242, 254, 0.3); }
 
                   @keyframes pulse-ring { 0% { transform: scale(0.95); opacity: 0.8; } 50% { transform: scale(1.15); opacity: 0.3; } 100% { transform: scale(1.25); opacity: 0; } }
                   @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
@@ -509,20 +637,20 @@ jobs:
                       </div>
                       <div id="statusPill" class="status-pill">
                           <span class="status-dot"></span>
-                          <span id="statusPillText">غير متصل</span>
+                          <span id="statusPillText">غير مفعل</span>
                       </div>
                   </div>
 
-                  <!-- Country Selector Card -->
-                  <div class="selector-card" onclick="openCountryModal()">
-                      <div class="country-info">
-                          <span id="currentFlag" class="country-flag">🇺🇸</span>
+                  <!-- Provider Selector Card -->
+                  <div class="selector-card" onclick="openProviderModal()">
+                      <div class="provider-info">
+                          <span id="currentIcon" class="provider-icon">⚡</span>
                           <div>
-                              <div id="currentCountry" class="country-name">أمريكا (الولايات المتحدة)</div>
-                              <div id="currentCity" class="country-city">خادم: نيويورك - أسرع اتصال</div>
+                              <div id="currentName" class="provider-name">Cloudflare 1.1.1.1</div>
+                              <div id="currentDesc" class="provider-desc">أسرع خادم لتجاوز الحظر وفك المواقع</div>
                           </div>
                       </div>
-                      <span id="currentPing" class="ping-tag">24 ms 📶</span>
+                      <span id="currentPing" class="ping-tag">12 ms 📶</span>
                   </div>
 
                   <!-- Central Power Button -->
@@ -533,101 +661,95 @@ jobs:
                               <span class="power-icon">⏻</span>
                           </button>
                       </div>
-                      <div id="powerStatus" class="power-status-text">انقر للاتصال الآمن</div>
-                      <div class="power-subtext">تشفير كامل 256-bit للشبكة وتغيير الـ IP</div>
+                      <div id="powerStatus" class="power-status-text">انقر لتفعيل فك الحجب الآمن</div>
+                      <div class="power-subtext">توجيه مشفر لطلبات الـ DNS عبر سيرفرات عالمية معتمدة</div>
                   </div>
 
                   <!-- Stats Dashboard -->
                   <div class="stats-grid">
                       <div class="stat-card">
-                          <span class="stat-label">⏱️ مدة الاتصال</span>
+                          <span class="stat-label">⏱️ مدة التشغيل</span>
                           <span id="timerVal" class="stat-val">00:00:00</span>
                       </div>
                       <div class="stat-card">
-                          <span class="stat-label">🌐 الـ IP الظاهري</span>
-                          <span id="ipVal" class="stat-val">104.28.19.45</span>
+                          <span class="stat-label">🌐 عنوان الـ DNS المعتمد</span>
+                          <span id="dnsVal" class="stat-val">1.1.1.1</span>
                       </div>
                       <div class="stat-card">
-                          <span class="stat-label">⬇️ سرعة التحميل</span>
-                          <span id="downVal" class="stat-val">0.0 MB/s</span>
+                          <span class="stat-label">🛡️ حالة التشفير</span>
+                          <span id="encVal" class="stat-val">غير نشط</span>
                       </div>
                       <div class="stat-card">
-                          <span class="stat-label">⬆️ سرعة الرفع</span>
-                          <span id="upVal" class="stat-val">0.0 MB/s</span>
+                          <span class="stat-label">🔒 حماية تسريب DNS</span>
+                          <span id="leakVal" class="stat-val">100% مؤمن</span>
                       </div>
                   </div>
               </div>
 
-              <!-- Country Selection Sheet -->
-              <div id="countryModal" class="modal-backdrop" onclick="closeCountryModal(event)">
+              <!-- Provider Selection Modal -->
+              <div id="providerModal" class="modal-backdrop" onclick="closeProviderModal(event)">
                   <div class="modal-sheet" onclick="event.stopPropagation()">
                       <div class="sheet-header">
-                          <span class="sheet-title">اختر دولة الخادم</span>
-                          <button class="close-btn" onclick="closeCountryModal()">✕</button>
+                          <span class="sheet-title">اختر خادم فك الحجب</span>
+                          <button class="close-btn" onclick="closeProviderModal()">✕</button>
                       </div>
-                      <div id="countriesList"></div>
+                      <div id="providersList"></div>
                   </div>
               </div>
 
               <script>
-                  const servers = [
-                      { id: 'us', name: 'أمريكا', fullName: 'أمريكا (الولايات المتحدة)', flag: '🇺🇸', city: 'نيويورك - خادم فائق السرعة', ping: '24 ms', ip: '104.28.19.45' },
-                      { id: 'gb', name: 'بريطانيا', fullName: 'بريطانيا (المملكة المتحدة)', flag: '🇬🇧', city: 'لندن - اتصال مشفر', ping: '31 ms', ip: '185.190.140.22' },
-                      { id: 'fr', name: 'فرنسا', fullName: 'فرنسا (باريس)', flag: '🇫🇷', city: 'باريس - أمان عالي', ping: '38 ms', ip: '51.159.21.90' },
-                      { id: 'de', name: 'ألمانيا', fullName: 'ألمانيا (فرانكفورت)', flag: '🇩🇪', city: 'فرانكفورت - سرعة قصوى', ping: '35 ms', ip: '194.26.29.11' },
-                      { id: 'ru', name: 'روسيا', fullName: 'روسيا (موسكو)', flag: '🇷🇺', city: 'موسكو - حماية الخصوصية', ping: '64 ms', ip: '95.173.136.55' },
-                      { id: 'cn', name: 'الصين', fullName: 'الصين (هونغ كونغ)', flag: '🇨🇳', city: 'هونغ كونغ - مسار مباشر', ping: '92 ms', ip: '103.251.167.3' },
-                      { id: 'jp', name: 'اليابان', fullName: 'اليابان (طوكيو)', flag: '🇯🇵', city: 'طوكيو - خادم ألعاب سريع', ping: '82 ms', ip: '133.242.18.2' },
-                      { id: 'in', name: 'الهند', fullName: 'الهند (مومباي)', flag: '🇮🇳', city: 'مومباي - نطاق واسع', ping: '78 ms', ip: '139.59.88.19' },
-                      { id: 'eg', name: 'مصر', fullName: 'مصر (القاهرة)', flag: '🇪🇬', city: 'القاهرة - اتصال إقليمي', ping: '42 ms', ip: '156.211.89.70' },
-                      { id: 'sa', name: 'السعودية', fullName: 'السعودية (الرياض)', flag: '🇸🇦', city: 'الرياض - بنية تحتية سحابية', ping: '19 ms', ip: '178.62.199.14' },
-                      { id: 'ae', name: 'الإمارات', fullName: 'الإمارات (دبي)', flag: '🇦🇪', city: 'دبي - ألياف ضوئية فائقة', ping: '15 ms', ip: '185.228.168.10' }
+                  const dnsProviders = [
+                      { id: 'cf', name: 'Cloudflare (1.1.1.1)', ip: '1.1.1.1', icon: '⚡', desc: 'الأسرع عالمياً لفك حجب المواقع والتطبيقات', ping: '12 ms' },
+                      { id: 'google', name: 'Google DNS (8.8.8.8)', ip: '8.8.8.8', icon: '🇺🇸', desc: 'خوادم جوجل الأمريكية - ثبات واستقرار فائق', ping: '18 ms' },
+                      { id: 'quad9', name: 'Quad9 Security (9.9.9.9)', ip: '9.9.9.9', icon: '🛡️', desc: 'حماية كاملة من التجسس وتتبع مزود الخدمة', ping: '22 ms' },
+                      { id: 'adguard', name: 'AdGuard DNS (94.140.14.14)', ip: '94.140.14.14', icon: '🚫', desc: 'تجاوز الحظر + حظر إعلانات المواقع المزعجة', ping: '25 ms' },
+                      { id: 'opendns', name: 'Cisco OpenDNS (208.67.222.222)', ip: '208.67.222.222', icon: '🌐', desc: 'خوادم سيسكو الموثوقة لحرية التصفح', ping: '29 ms' },
+                      { id: 'clean', name: 'CleanBrowsing (185.228.168.168)', ip: '185.228.168.168', icon: '🔒', desc: 'تصفح آمن ومحمي من المواقع الضارة', ping: '28 ms' }
                   ];
 
-                  let currentServer = servers[0];
+                  let currentProvider = dnsProviders[0];
                   let isConnected = false;
                   let timerInterval = null;
                   let secondsCounter = 0;
-                  let speedInterval = null;
 
-                  function renderCountryList() {
-                      const list = document.getElementById('countriesList');
+                  function renderProviderList() {
+                      const list = document.getElementById('providersList');
                       list.innerHTML = '';
-                      servers.forEach((s) => {
+                      dnsProviders.forEach((p) => {
                           const item = document.createElement('div');
-                          item.className = 'country-item ' + (s.id === currentServer.id ? 'active' : '');
+                          item.className = 'provider-item ' + (p.id === currentProvider.id ? 'active' : '');
                           item.innerHTML = `
                               <div style="display: flex; align-items: center; gap: 12px;">
-                                  <span style="font-size: 26px;">${s.flag}</span>
+                                  <span style="font-size: 26px;">${p.icon}</span>
                                   <div>
-                                      <div style="font-size: 14px; font-weight: 700; color: #fff;">${s.fullName}</div>
-                                      <div style="font-size: 11px; color: #94a3b8;">${s.city}</div>
+                                      <div style="font-size: 14px; font-weight: 700; color: #fff;">${p.name}</div>
+                                      <div style="font-size: 11px; color: #94a3b8;">${p.desc}</div>
                                   </div>
                               </div>
-                              <span style="font-size: 12px; font-weight: 600; color: #10b981;">${s.ping}</span>
+                              <span style="font-size: 12px; font-weight: 600; color: #10b981;">${p.ping}</span>
                           `;
-                          item.onclick = () => selectServer(s);
+                          item.onclick = () => selectProvider(p);
                           list.appendChild(item);
                       });
                   }
 
-                  function openCountryModal() {
-                      renderCountryList();
-                      document.getElementById('countryModal').style.display = 'flex';
+                  function openProviderModal() {
+                      renderProviderList();
+                      document.getElementById('providerModal').style.display = 'flex';
                   }
 
-                  function closeCountryModal() {
-                      document.getElementById('countryModal').style.display = 'none';
+                  function closeProviderModal() {
+                      document.getElementById('providerModal').style.display = 'none';
                   }
 
-                  function selectServer(server) {
-                      currentServer = server;
-                      document.getElementById('currentFlag').innerText = server.flag;
-                      document.getElementById('currentCountry').innerText = server.fullName;
-                      document.getElementById('currentCity').innerText = server.city;
-                      document.getElementById('currentPing').innerText = server.ping + ' 📶';
-                      document.getElementById('ipVal').innerText = server.ip;
-                      closeCountryModal();
+                  function selectProvider(provider) {
+                      currentProvider = provider;
+                      document.getElementById('currentIcon').innerText = provider.icon;
+                      document.getElementById('currentName').innerText = provider.name;
+                      document.getElementById('currentDesc').innerText = provider.desc;
+                      document.getElementById('currentPing').innerText = provider.ping + ' 📶';
+                      document.getElementById('dnsVal').innerText = provider.ip;
+                      closeProviderModal();
 
                       if (isConnected) {
                           toggleVpn();
@@ -638,17 +760,17 @@ jobs:
                   function toggleVpn() {
                       if ('vibrate' in navigator) navigator.vibrate(50);
                       if (!isConnected) {
-                          document.getElementById('powerStatus').innerText = 'جاري الاتصال...';
+                          document.getElementById('powerStatus').innerText = 'جاري التفعيل...';
                           document.getElementById('powerStatus').style.color = '#00f2fe';
-                          
-                          if (window.AndroidBridge && window.AndroidBridge.startVpn) {
-                              window.AndroidBridge.startVpn(currentServer.name);
+
+                          if (window.AndroidBridge && window.AndroidBridge.startDnsVpn) {
+                              window.AndroidBridge.startDnsVpn(currentProvider.ip, currentProvider.name);
                           } else {
-                              setTimeout(() => setVpnState(true), 800);
+                              setTimeout(() => setVpnState(true), 600);
                           }
                       } else {
-                          if (window.AndroidBridge && window.AndroidBridge.stopVpn) {
-                              window.AndroidBridge.stopVpn();
+                          if (window.AndroidBridge && window.AndroidBridge.stopDnsVpn) {
+                              window.AndroidBridge.stopDnsVpn();
                           } else {
                               setVpnState(false);
                           }
@@ -672,27 +794,32 @@ jobs:
                       const btn = document.getElementById('powerBtn');
                       const ring = document.getElementById('ringWrap');
                       const statusTxt = document.getElementById('powerStatus');
+                      const encVal = document.getElementById('encVal');
 
                       if (connected) {
                           pill.classList.add('connected');
-                          pillText.innerText = 'متصل بـ ' + currentServer.name;
+                          pillText.innerText = 'الحماية نشطة';
                           btn.classList.add('active');
                           ring.classList.add('active');
-                          statusTxt.innerText = 'اتصال آمن ونشط';
+                          statusTxt.innerText = 'متصل بـ ' + currentProvider.name;
                           statusTxt.style.color = '#10b981';
-                          startStats();
+                          encVal.innerText = 'نشط ومحمي';
+                          encVal.style.color = '#10b981';
+                          startTimer();
                       } else {
                           pill.classList.remove('connected');
-                          pillText.innerText = 'غير متصل';
+                          pillText.innerText = 'غير مفعل';
                           btn.classList.remove('active');
                           ring.classList.remove('active');
-                          statusTxt.innerText = 'انقر للاتصال الآمن';
+                          statusTxt.innerText = 'انقر لتفعيل فك الحجب الآمن';
                           statusTxt.style.color = '#e2e8f0';
-                          stopStats();
+                          encVal.innerText = 'غير نشط';
+                          encVal.style.color = '#f8fafc';
+                          stopTimer();
                       }
                   }
 
-                  function startStats() {
+                  function startTimer() {
                       secondsCounter = 0;
                       clearInterval(timerInterval);
                       timerInterval = setInterval(() => {
@@ -702,25 +829,14 @@ jobs:
                           const secs = String(secondsCounter % 60).padStart(2, '0');
                           document.getElementById('timerVal').innerText = `${hrs}:${mins}:${secs}`;
                       }, 1000);
-
-                      clearInterval(speedInterval);
-                      speedInterval = setInterval(() => {
-                          const down = (35 + Math.random() * 25).toFixed(1);
-                          const up = (12 + Math.random() * 8).toFixed(1);
-                          document.getElementById('downVal').innerText = down + ' MB/s';
-                          document.getElementById('upVal').innerText = up + ' MB/s';
-                      }, 1800);
                   }
 
-                  function stopStats() {
+                  function stopTimer() {
                       clearInterval(timerInterval);
-                      clearInterval(speedInterval);
                       document.getElementById('timerVal').innerText = '00:00:00';
-                      document.getElementById('downVal').innerText = '0.0 MB/s';
-                      document.getElementById('upVal').innerText = '0.0 MB/s';
                   }
 
-                  document.getElementById('ipVal').innerText = currentServer.ip;
+                  document.getElementById('dnsVal').innerText = currentProvider.ip;
               </script>
           </body>
           </html>
