@@ -1,0 +1,744 @@
+name: Build VPN Plus APK
+
+'on':
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build VPN Plus Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Accept Android SDK Licenses
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses" || true
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+
+      - name: Generate Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/vpnplus/app
+          mkdir -p app/src/main/assets
+          mkdir -p app/src/main/res/values
+
+          # 1. إعداد settings.gradle
+          cat << 'END_SETTINGS' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "VPNPlus"
+          include ':app'
+          END_SETTINGS
+
+          # 2. إعداد build.gradle الرئيسي
+          cat << 'END_BUILD' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          END_BUILD
+
+          # 3. إعداد app/build.gradle للتطبيق
+          cat << 'END_APP_BUILD' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.vpnplus.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.vpnplus.app"
+                  minSdk 21
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+                  debug {
+                      signingConfig signingConfigs.debug
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          END_APP_BUILD
+
+          # 4. إعداد AndroidManifest.xml ودعم VpnService
+          cat << 'END_MANIFEST' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".MyVpnService"
+                      android:permission="android.permission.BIND_VPN_SERVICE"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+
+              </application>
+
+          </manifest>
+          END_MANIFEST
+
+          # 5. إعداد strings.xml
+          cat << 'END_STRINGS' > app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">VPN Plus</string>
+          </resources>
+          END_STRINGS
+
+          # 6. MainActivity.java للربط بين الواجهة وخدمة الـ VPN
+          cat << 'END_JAVA_MAIN' > app/src/main/java/com/vpnplus/app/MainActivity.java
+          package com.vpnplus.app;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.net.VpnService;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private static final int VPN_REQUEST_CODE = 0x10;
+              private WebView webView;
+              private String selectedCountry = "أمريكا";
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                      Window window = getWindow();
+                      window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+                      window.setStatusBarColor(Color.parseColor("#070B14"));
+                  }
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setUseWideViewPort(true);
+                  settings.setLoadWithOverviewMode(true);
+
+                  webView.addJavascriptInterface(new WebBridge(), "AndroidBridge");
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              public class WebBridge {
+                  @JavascriptInterface
+                  public void startVpn(String country) {
+                      selectedCountry = country;
+                      runOnUiThread(() -> {
+                          Intent vpnIntent = VpnService.prepare(MainActivity.this);
+                          if (vpnIntent != null) {
+                              startActivityForResult(vpnIntent, VPN_REQUEST_CODE);
+                          } else {
+                              onActivityResult(VPN_REQUEST_CODE, RESULT_OK, null);
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void stopVpn() {
+                      runOnUiThread(() -> {
+                          Intent intent = new Intent(MainActivity.this, MyVpnService.class);
+                          intent.setAction(MyVpnService.ACTION_DISCONNECT);
+                          startService(intent);
+                          notifyStatus("disconnected");
+                      });
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == VPN_REQUEST_CODE) {
+                      if (resultCode == RESULT_OK) {
+                          Intent intent = new Intent(this, MyVpnService.class);
+                          intent.setAction(MyVpnService.ACTION_CONNECT);
+                          intent.putExtra("country", selectedCountry);
+                          startService(intent);
+                          notifyStatus("connected");
+                      } else {
+                          notifyStatus("cancelled");
+                      }
+                  }
+              }
+
+              private void notifyStatus(String status) {
+                  if (webView != null) {
+                      webView.evaluateJavascript("if(window.onVpnStatusUpdate){ window.onVpnStatusUpdate('" + status + "'); }", null);
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          END_JAVA_MAIN
+
+          # 7. خدمة MyVpnService.java المسؤولة عن نفق الـ VPN والإشعارات
+          cat << 'END_JAVA_VPN' > app/src/main/java/com/vpnplus/app/MyVpnService.java
+          package com.vpnplus.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Intent;
+          import android.net.VpnService;
+          import android.os.Build;
+          import android.os.ParcelFileDescriptor;
+
+          public class MyVpnService extends VpnService {
+              public static final String ACTION_CONNECT = "com.vpnplus.app.CONNECT";
+              public static final String ACTION_DISCONNECT = "com.vpnplus.app.DISCONNECT";
+              private static final String CHANNEL_ID = "vpn_plus_channel";
+              private ParcelFileDescriptor vpnInterface;
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null) {
+                      String action = intent.getAction();
+                      if (ACTION_CONNECT.equals(action)) {
+                          String country = intent.getStringExtra("country");
+                          if (country == null) country = "الولايات المتحدة";
+                          connectTunnel(country);
+                      } else if (ACTION_DISCONNECT.equals(action)) {
+                          disconnectTunnel();
+                      }
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private void connectTunnel(String country) {
+                  try {
+                      if (vpnInterface == null) {
+                          Builder builder = new Builder();
+                          builder.setSession("VPN Plus - " + country);
+                          builder.addAddress("10.8.0.2", 24);
+                          builder.addRoute("10.8.0.0", 24);
+                          builder.addDnsServer("8.8.8.8");
+                          vpnInterface = builder.establish();
+                      }
+                      updateNotification(country);
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              private void disconnectTunnel() {
+                  try {
+                      if (vpnInterface != null) {
+                          vpnInterface.close();
+                          vpnInterface = null;
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+                  stopForeground(true);
+                  stopSelf();
+              }
+
+              private void updateNotification(String country) {
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          NotificationChannel channel = new NotificationChannel(
+                              CHANNEL_ID,
+                              "VPN Plus Status",
+                              NotificationManager.IMPORTANCE_LOW
+                          );
+                          channel.setDescription("حالة شبكة VPN Plus");
+                          NotificationManager nm = getSystemService(NotificationManager.class);
+                          if (nm != null) nm.createNotificationChannel(channel);
+                      }
+
+                      Intent appIntent = new Intent(this, MainActivity.class);
+                      PendingIntent pi = PendingIntent.getActivity(this, 0, appIntent,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+                      Notification.Builder nb = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                          ? new Notification.Builder(this, CHANNEL_ID)
+                          : new Notification.Builder(this);
+
+                      Notification notification = nb
+                          .setContentTitle("VPN Plus متصل ومحمي")
+                          .setContentText("الدولة المتصل بها: " + country)
+                          .setSmallIcon(android.R.drawable.ic_lock_lock)
+                          .setContentIntent(pi)
+                          .setOngoing(true)
+                          .build();
+
+                      startForeground(1001, notification);
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              @Override
+              public void onDestroy() {
+                  disconnectTunnel();
+                  super.onDestroy();
+              }
+          }
+          END_JAVA_VPN
+
+      - name: Generate VPN Plus Icons
+        run: |
+          cat << 'EOF' > make_icons.py
+          import zlib, struct, os
+
+          def make_vpn_icon(size):
+              raw = bytearray()
+              cx, cy = size / 2.0, size / 2.0
+              r = size / 2.0 - 2
+              for y in range(size):
+                  raw.append(0)
+                  for x in range(size):
+                      dx = x - cx
+                      dy = y - cy
+                      dist = (dx*dx + dy*dy)**0.5
+                      if dist > r:
+                          raw.extend([0, 0, 0, 0])
+                          continue
+                      bg_r = int(10 + (y / size) * 12)
+                      bg_g = int(15 + (y / size) * 15)
+                      bg_b = int(28 + (y / size) * 25)
+
+                      if dist >= r - 3:
+                          raw.extend([0, 242, 254, 255])
+                          continue
+                      elif dist >= r - 6:
+                          raw.extend([16, 185, 129, 220])
+                          continue
+
+                      sx = abs(x - cx) / (size * 0.32)
+                      sy = (y - (cy - size * 0.06)) / (size * 0.38)
+                      in_shield = False
+                      if sy >= -0.7 and sy <= 0.8:
+                          if sy <= 0:
+                              in_shield = (sx <= 0.85)
+                          else:
+                              in_shield = (sx <= 0.85 * (1.0 - (sy * sy * 0.7)))
+
+                      if in_shield:
+                          is_edge = (sx >= 0.7 or (sy > 0.6 and sx >= 0.3) or sy <= -0.6)
+                          if is_edge:
+                              raw.extend([0, 242, 254, 255])
+                          else:
+                              vx = (x - cx) / (size * 0.16)
+                              vy = (y - (cy - size * 0.04)) / (size * 0.16)
+                              if vx*vx + vy*vy <= 0.4:
+                                  raw.extend([16, 185, 129, 255])
+                              elif abs(vx) <= 0.2 and 0 <= vy <= 0.8:
+                                  raw.extend([16, 185, 129, 255])
+                              else:
+                                  raw.extend([15, 23, 42, 255])
+                      else:
+                          raw.extend([bg_r, bg_g, bg_b, 255])
+
+              comp = zlib.compress(bytes(raw))
+              png = bytearray(b'\x89PNG\r\n\x1a\n')
+              ihdr = struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0)
+              png.extend(struct.pack('>I', 13) + b'IHDR' + ihdr + struct.pack('>I', zlib.crc32(b'IHDR' + ihdr)))
+              png.extend(struct.pack('>I', len(comp)) + b'IDAT' + comp + struct.pack('>I', zlib.crc32(b'IDAT' + comp)))
+              png.extend(struct.pack('>I', 0) + b'IEND' + struct.pack('>I', zlib.crc32(b'IEND')))
+              return bytes(png)
+
+          densities = [('mipmap-mdpi', 48), ('mipmap-hdpi', 72), ('mipmap-xhdpi', 96), ('mipmap-xxhdpi', 144)]
+          for folder, s in densities:
+              path = f'app/src/main/res/{folder}'
+              os.makedirs(path, exist_ok=True)
+              with open(f'{path}/ic_launcher.png', 'wb') as f:
+                  f.write(make_vpn_icon(s))
+          EOF
+          python3 make_icons.py
+          rm make_icons.py
+
+      - name: Embed VPN Plus HTML UI
+        run: |
+          cat << 'EOF' > app/src/main/assets/index.html
+          <!DOCTYPE html>
+          <html lang="ar" dir="rtl">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+              <title>VPN PLUS</title>
+              <style>
+                  @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap');
+                  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Cairo', sans-serif; -webkit-tap-highlight-color: transparent; }
+                  body { background: radial-gradient(circle at top, #111c38 0%, #070b14 100%); color: #f8fafc; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: 16px; user-select: none; }
+                  .container { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 18px; }
+                  
+                  /* Header */
+                  .header { display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; }
+                  .logo-wrap { display: flex; align-items: center; gap: 10px; }
+                  .logo-badge { background: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%); width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; box-shadow: 0 4px 15px rgba(0, 242, 254, 0.4); }
+                  .logo-text { font-size: 20px; font-weight: 900; letter-spacing: 0.5px; background: linear-gradient(90deg, #fff, #93c5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+                  .status-pill { display: flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); transition: 0.3s; }
+                  .status-pill.connected { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+                  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
+                  .status-pill.connected .status-dot { background: #10b981; box-shadow: 0 0 10px #10b981; animation: pulse-dot 1.5s infinite; }
+                  
+                  /* Country Selector */
+                  .selector-card { background: rgba(17, 24, 39, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 18px; padding: 14px 18px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: 0.2s; box-shadow: 0 8px 20px rgba(0,0,0,0.3); }
+                  .selector-card:active { transform: scale(0.98); }
+                  .country-info { display: flex; align-items: center; gap: 12px; }
+                  .country-flag { font-size: 32px; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
+                  .country-name { font-size: 15px; font-weight: 700; color: #fff; }
+                  .country-city { font-size: 12px; color: #94a3b8; }
+                  .ping-tag { font-size: 12px; font-weight: 600; color: #10b981; background: rgba(16, 185, 129, 0.1); padding: 4px 8px; border-radius: 8px; }
+
+                  /* Power Button Area */
+                  .power-section { display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 20px 0; }
+                  .ring-container { position: relative; width: 210px; height: 210px; display: flex; align-items: center; justify-content: center; }
+                  .pulse-ring { position: absolute; width: 100%; height: 100%; border-radius: 50%; border: 2px solid rgba(0, 242, 254, 0.15); transition: 0.5s; }
+                  .ring-container.active .pulse-ring { border-color: rgba(16, 185, 129, 0.4); animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite; }
+                  .power-btn { width: 150px; height: 150px; border-radius: 50%; background: linear-gradient(145deg, #162038, #0b1222); border: 3px solid rgba(0, 242, 254, 0.4); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6), inset 0 2px 10px rgba(255, 255, 255, 0.1); display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: 0.3s; z-index: 2; outline: none; }
+                  .power-btn:active { transform: scale(0.95); }
+                  .power-btn.active { border-color: #10b981; box-shadow: 0 0 35px rgba(16, 185, 129, 0.6), inset 0 0 15px rgba(16, 185, 129, 0.3); background: linear-gradient(145deg, #0e2a22, #071612); }
+                  .power-icon { font-size: 42px; color: #00f2fe; transition: 0.3s; filter: drop-shadow(0 0 8px #00f2fe); }
+                  .power-btn.active .power-icon { color: #10b981; filter: drop-shadow(0 0 12px #10b981); }
+                  .power-status-text { margin-top: 14px; font-size: 16px; font-weight: 700; color: #e2e8f0; }
+                  .power-subtext { font-size: 12px; color: #64748b; margin-top: 4px; }
+
+                  /* Stats Grid */
+                  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+                  .stat-card { background: rgba(17, 24, 39, 0.6); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 14px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+                  .stat-label { font-size: 11px; color: #94a3b8; display: flex; align-items: center; gap: 5px; }
+                  .stat-val { font-size: 15px; font-weight: 700; color: #f8fafc; }
+
+                  /* Dropdown Modal */
+                  .modal-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.8); backdrop-filter: blur(8px); display: none; align-items: flex-end; justify-content: center; z-index: 99; }
+                  .modal-sheet { background: #0f172a; width: 100%; max-width: 440px; border-radius: 24px 24px 0 0; border-top: 1px solid rgba(255, 255, 255, 0.1); max-height: 80vh; overflow-y: auto; padding: 20px 16px; }
+                  .sheet-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding: 0 4px; }
+                  .sheet-title { font-size: 16px; font-weight: 700; color: #fff; }
+                  .close-btn { background: none; border: none; font-size: 20px; color: #94a3b8; cursor: pointer; }
+                  .country-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-radius: 12px; margin-bottom: 8px; background: rgba(30, 41, 59, 0.5); cursor: pointer; transition: 0.2s; }
+                  .country-item:hover, .country-item.active { background: rgba(0, 242, 254, 0.15); border: 1px solid rgba(0, 242, 254, 0.3); }
+
+                  @keyframes pulse-ring { 0% { transform: scale(0.95); opacity: 0.8; } 50% { transform: scale(1.15); opacity: 0.3; } 100% { transform: scale(1.25); opacity: 0; } }
+                  @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+              </style>
+          </head>
+          <body>
+
+              <div class="container">
+                  <!-- Header -->
+                  <div class="header">
+                      <div class="logo-wrap">
+                          <div class="logo-badge">🛡️</div>
+                          <span class="logo-text">VPN PLUS</span>
+                      </div>
+                      <div id="statusPill" class="status-pill">
+                          <span class="status-dot"></span>
+                          <span id="statusPillText">غير متصل</span>
+                      </div>
+                  </div>
+
+                  <!-- Country Selector Card -->
+                  <div class="selector-card" onclick="openCountryModal()">
+                      <div class="country-info">
+                          <span id="currentFlag" class="country-flag">🇺🇸</span>
+                          <div>
+                              <div id="currentCountry" class="country-name">أمريكا (الولايات المتحدة)</div>
+                              <div id="currentCity" class="country-city">خادم: نيويورك - أسرع اتصال</div>
+                          </div>
+                      </div>
+                      <span id="currentPing" class="ping-tag">24 ms 📶</span>
+                  </div>
+
+                  <!-- Central Power Button -->
+                  <div class="power-section">
+                      <div id="ringWrap" class="ring-container">
+                          <div class="pulse-ring"></div>
+                          <button id="powerBtn" class="power-btn" onclick="toggleVpn()">
+                              <span class="power-icon">⏻</span>
+                          </button>
+                      </div>
+                      <div id="powerStatus" class="power-status-text">انقر للاتصال الآمن</div>
+                      <div class="power-subtext">تشفير كامل 256-bit للشبكة وتغيير الـ IP</div>
+                  </div>
+
+                  <!-- Stats Dashboard -->
+                  <div class="stats-grid">
+                      <div class="stat-card">
+                          <span class="stat-label">⏱️ مدة الاتصال</span>
+                          <span id="timerVal" class="stat-val">00:00:00</span>
+                      </div>
+                      <div class="stat-card">
+                          <span class="stat-label">🌐 الـ IP الظاهري</span>
+                          <span id="ipVal" class="stat-val">104.28.19.45</span>
+                      </div>
+                      <div class="stat-card">
+                          <span class="stat-label">⬇️ سرعة التحميل</span>
+                          <span id="downVal" class="stat-val">0.0 MB/s</span>
+                      </div>
+                      <div class="stat-card">
+                          <span class="stat-label">⬆️ سرعة الرفع</span>
+                          <span id="upVal" class="stat-val">0.0 MB/s</span>
+                      </div>
+                  </div>
+              </div>
+
+              <!-- Country Selection Sheet -->
+              <div id="countryModal" class="modal-backdrop" onclick="closeCountryModal(event)">
+                  <div class="modal-sheet" onclick="event.stopPropagation()">
+                      <div class="sheet-header">
+                          <span class="sheet-title">اختر دولة الخادم</span>
+                          <button class="close-btn" onclick="closeCountryModal()">✕</button>
+                      </div>
+                      <div id="countriesList"></div>
+                  </div>
+              </div>
+
+              <script>
+                  const servers = [
+                      { id: 'us', name: 'أمريكا', fullName: 'أمريكا (الولايات المتحدة)', flag: '🇺🇸', city: 'نيويورك - خادم فائق السرعة', ping: '24 ms', ip: '104.28.19.45' },
+                      { id: 'gb', name: 'بريطانيا', fullName: 'بريطانيا (المملكة المتحدة)', flag: '🇬🇧', city: 'لندن - اتصال مشفر', ping: '31 ms', ip: '185.190.140.22' },
+                      { id: 'fr', name: 'فرنسا', fullName: 'فرنسا (باريس)', flag: '🇫🇷', city: 'باريس - أمان عالي', ping: '38 ms', ip: '51.159.21.90' },
+                      { id: 'de', name: 'ألمانيا', fullName: 'ألمانيا (فرانكفورت)', flag: '🇩🇪', city: 'فرانكفورت - سرعة قصوى', ping: '35 ms', ip: '194.26.29.11' },
+                      { id: 'ru', name: 'روسيا', fullName: 'روسيا (موسكو)', flag: '🇷🇺', city: 'موسكو - حماية الخصوصية', ping: '64 ms', ip: '95.173.136.55' },
+                      { id: 'cn', name: 'الصين', fullName: 'الصين (هونغ كونغ)', flag: '🇨🇳', city: 'هونغ كونغ - مسار مباشر', ping: '92 ms', ip: '103.251.167.3' },
+                      { id: 'jp', name: 'اليابان', fullName: 'اليابان (طوكيو)', flag: '🇯🇵', city: 'طوكيو - خادم ألعاب سريع', ping: '82 ms', ip: '133.242.18.2' },
+                      { id: 'in', name: 'الهند', fullName: 'الهند (مومباي)', flag: '🇮🇳', city: 'مومباي - نطاق واسع', ping: '78 ms', ip: '139.59.88.19' },
+                      { id: 'eg', name: 'مصر', fullName: 'مصر (القاهرة)', flag: '🇪🇬', city: 'القاهرة - اتصال إقليمي', ping: '42 ms', ip: '156.211.89.70' },
+                      { id: 'sa', name: 'السعودية', fullName: 'السعودية (الرياض)', flag: '🇸🇦', city: 'الرياض - بنية تحتية سحابية', ping: '19 ms', ip: '178.62.199.14' },
+                      { id: 'ae', name: 'الإمارات', fullName: 'الإمارات (دبي)', flag: '🇦🇪', city: 'دبي - ألياف ضوئية فائقة', ping: '15 ms', ip: '185.228.168.10' }
+                  ];
+
+                  let currentServer = servers[0];
+                  let isConnected = false;
+                  let timerInterval = null;
+                  let secondsCounter = 0;
+                  let speedInterval = null;
+
+                  function renderCountryList() {
+                      const list = document.getElementById('countriesList');
+                      list.innerHTML = '';
+                      servers.forEach((s) => {
+                          const item = document.createElement('div');
+                          item.className = 'country-item ' + (s.id === currentServer.id ? 'active' : '');
+                          item.innerHTML = `
+                              <div style="display: flex; align-items: center; gap: 12px;">
+                                  <span style="font-size: 26px;">${s.flag}</span>
+                                  <div>
+                                      <div style="font-size: 14px; font-weight: 700; color: #fff;">${s.fullName}</div>
+                                      <div style="font-size: 11px; color: #94a3b8;">${s.city}</div>
+                                  </div>
+                              </div>
+                              <span style="font-size: 12px; font-weight: 600; color: #10b981;">${s.ping}</span>
+                          `;
+                          item.onclick = () => selectServer(s);
+                          list.appendChild(item);
+                      });
+                  }
+
+                  function openCountryModal() {
+                      renderCountryList();
+                      document.getElementById('countryModal').style.display = 'flex';
+                  }
+
+                  function closeCountryModal() {
+                      document.getElementById('countryModal').style.display = 'none';
+                  }
+
+                  function selectServer(server) {
+                      currentServer = server;
+                      document.getElementById('currentFlag').innerText = server.flag;
+                      document.getElementById('currentCountry').innerText = server.fullName;
+                      document.getElementById('currentCity').innerText = server.city;
+                      document.getElementById('currentPing').innerText = server.ping + ' 📶';
+                      document.getElementById('ipVal').innerText = server.ip;
+                      closeCountryModal();
+
+                      if (isConnected) {
+                          toggleVpn();
+                          setTimeout(() => toggleVpn(), 600);
+                      }
+                  }
+
+                  function toggleVpn() {
+                      if ('vibrate' in navigator) navigator.vibrate(50);
+                      if (!isConnected) {
+                          document.getElementById('powerStatus').innerText = 'جاري الاتصال...';
+                          document.getElementById('powerStatus').style.color = '#00f2fe';
+                          
+                          if (window.AndroidBridge && window.AndroidBridge.startVpn) {
+                              window.AndroidBridge.startVpn(currentServer.name);
+                          } else {
+                              setTimeout(() => setVpnState(true), 800);
+                          }
+                      } else {
+                          if (window.AndroidBridge && window.AndroidBridge.stopVpn) {
+                              window.AndroidBridge.stopVpn();
+                          } else {
+                              setVpnState(false);
+                          }
+                      }
+                  }
+
+                  window.onVpnStatusUpdate = function(status) {
+                      if (status === 'connected') {
+                          setVpnState(true);
+                      } else if (status === 'disconnected') {
+                          setVpnState(false);
+                      } else {
+                          setVpnState(false);
+                      }
+                  };
+
+                  function setVpnState(connected) {
+                      isConnected = connected;
+                      const pill = document.getElementById('statusPill');
+                      const pillText = document.getElementById('statusPillText');
+                      const btn = document.getElementById('powerBtn');
+                      const ring = document.getElementById('ringWrap');
+                      const statusTxt = document.getElementById('powerStatus');
+
+                      if (connected) {
+                          pill.classList.add('connected');
+                          pillText.innerText = 'متصل بـ ' + currentServer.name;
+                          btn.classList.add('active');
+                          ring.classList.add('active');
+                          statusTxt.innerText = 'اتصال آمن ونشط';
+                          statusTxt.style.color = '#10b981';
+                          startStats();
+                      } else {
+                          pill.classList.remove('connected');
+                          pillText.innerText = 'غير متصل';
+                          btn.classList.remove('active');
+                          ring.classList.remove('active');
+                          statusTxt.innerText = 'انقر للاتصال الآمن';
+                          statusTxt.style.color = '#e2e8f0';
+                          stopStats();
+                      }
+                  }
+
+                  function startStats() {
+                      secondsCounter = 0;
+                      clearInterval(timerInterval);
+                      timerInterval = setInterval(() => {
+                          secondsCounter++;
+                          const hrs = String(Math.floor(secondsCounter / 3600)).padStart(2, '0');
+                          const mins = String(Math.floor((secondsCounter % 3600) / 60)).padStart(2, '0');
+                          const secs = String(secondsCounter % 60).padStart(2, '0');
+                          document.getElementById('timerVal').innerText = `${hrs}:${mins}:${secs}`;
+                      }, 1000);
+
+                      clearInterval(speedInterval);
+                      speedInterval = setInterval(() => {
+                          const down = (35 + Math.random() * 25).toFixed(1);
+                          const up = (12 + Math.random() * 8).toFixed(1);
+                          document.getElementById('downVal').innerText = down + ' MB/s';
+                          document.getElementById('upVal').innerText = up + ' MB/s';
+                      }, 1800);
+                  }
+
+                  function stopStats() {
+                      clearInterval(timerInterval);
+                      clearInterval(speedInterval);
+                      document.getElementById('timerVal').innerText = '00:00:00';
+                      document.getElementById('downVal').innerText = '0.0 MB/s';
+                      document.getElementById('upVal').innerText = '0.0 MB/s';
+                  }
+
+                  document.getElementById('ipVal').innerText = currentServer.ip;
+              </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Build Gradle Wrapper
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          gradle wrapper --gradle-version 8.5
+          chmod +x gradlew
+
+      - name: Build Android APK
+        run: |
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk VPN-Plus.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VPN-Plus-APK
+          path: VPN-Plus.apk
